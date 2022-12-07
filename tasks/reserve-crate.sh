@@ -22,7 +22,7 @@ if [ "$check_if_crate_exists" ]; then
     22) # "not found" exit code; means that the crate doesn't exist and can be reserved
     ;;
     0)
-      >&2 echo "Crate already exists: $1"
+      >&2 echo "Crate already exists: $name"
       exit 1
     ;;
     *)
