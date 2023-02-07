@@ -23,23 +23,24 @@ tmp="$root/.tmp"
 cratesio_repo="$tmp/crates.io"
 tmp_cargo_root="$tmp/cargo"
 yj="$tmp/yj"
+published_crates_log="$tmp/published-crates"
 
+# https://doc.rust-lang.org/cargo/reference/config.html#hierarchical-structure
+system_cargo_config_dir=/.cargo
+
+# shellcheck disable=SC2317 # flow analysis doesn't work properly for exit traps
 on_exit() {
   local exit_code=$?
-
-  set +x
 
   rm -rf "$tmp"
   pkill -P "$$" || :
 
-  exit $exit_code
+  exit "$exit_code"
 }
 trap on_exit EXIT
 
 die() {
   local exit_code=$?
-
-  set +x
 
   local kill_group
   if [ "${2:-}" ]; then
@@ -72,10 +73,70 @@ die() {
   fi
 }
 
-set -xv
+setup_local_cargo_config() {
+  local initial_commit="$1"
+  local mode="$2"
+
+  case "$mode" in
+    on)
+      mkdir -p "$root/.cargo"
+
+      # This configuration forces that packages are consumed solely from the
+      # local registry. Without this cargo might consume packages from both the
+      # local and the official registry, which can cause problems because cargo
+      # consider crates hosted in different registries as different packages
+      # even if they are identical, thus resulting in conflicts.
+      config="
+[registry]
+default = \"local\"
+
+[registries]
+
+[registries.local]
+index = \"$CARGO_REGISTRIES_LOCAL_INDEX\"
+token = \"$CARGO_REGISTRIES_LOCAL_TOKEN\"
+
+[source]
+
+[source.local]
+registry = \"$CARGO_SOURCE_LOCAL_REGISTRY\"
+
+[source.crates-io]
+replace-with = \"local\"
+      "
+
+      # Make `cargo` pick up the local registry configuration for builds which
+      # happen within the context of $root
+      echo "$config" >> "$root/.cargo/config.toml"
+
+      # Make `cargo` also pick up the local registry configuration for builds
+      # anywhere else. This is relevant because packages' checks and builds
+      # might happen outside of $root, in which case cargo would not pick up the
+      # $root/.cargo/config.toml and thus would resolve dependencies
+      # incorrectly.
+      # Example: https://gitlab.parity.io/parity/mirrors/polkadot/-/jobs/2299989#L3298
+      sudo mkdir -p "$system_cargo_config_dir"
+      echo "$config" | sudo tee "$system_cargo_config_dir/config.toml" >/dev/null
+    ;;
+    off)
+      # clean up index.lock file in case some previous command has left the Git
+      # tree in a bad state, otherwise `git checkout` will fail
+      rm -f "$root/.git/index.lock"
+      if ! git checkout "$initial_commit" "$root/.cargo/config.toml"; then
+        rm "$root/.cargo/config.toml"
+      fi
+      sudo rm "$system_cargo_config_dir/config.toml"
+    ;;
+  esac
+}
 
 setup_local_cratesio() {
-  load_workspace_crates
+  local cratesio_local_crates="${1:-}"
+
+  if [ ! "$cratesio_local_crates" ]; then
+    load_workspace_crates
+    cratesio_local_crates="${workspace_crates[*]}"
+  fi
 
   git clone --branch releng https://github.com/paritytech/crates.io "$cratesio_repo"
 
@@ -97,13 +158,14 @@ setup_local_cratesio() {
   export CARGO_REGISTRIES_LOCAL_INDEX=file://"$cratesio_repo"/tmp/index-bare
 
   export GIT_REPO_URL="file://$PWD/tmp/index-bare"
+  export CARGO_SOURCE_LOCAL_REGISTRY="$GIT_REPO_URL"
   export GH_CLIENT_ID=
   export GH_CLIENT_SECRET=
   export WEB_ALLOWED_ORIGINS=http://localhost:8888,http://localhost:4200
   export SESSION_KEY=badkeyabcdefghijklmnopqrstuvwxyzabcdef
   export CRATESIO_TOKEN_PREFIX="$cratesio_token_prefix"
   export WEB_NEW_PKG_RATE_LIMIT_BURST=10248
-  export CRATESIO_LOCAL_CRATES="${workspace_crates[*]}"
+  export CRATESIO_LOCAL_CRATES="$cratesio_local_crates"
 
   cargo run --quiet --bin server | while IFS= read -r line; do
     case "$line" in
@@ -161,6 +223,7 @@ setup_local_cratesio() {
             -p "$crate" \
             || die all "Failed to clear build cache for crate $crate"
 
+          echo "$crate=$crate_version" >> "$published_crates_log"
           echo "$crate" >> "$SPUB_CRATES_COMMITTED_FILE"
         else
           die all "background-worker line had unexpected format: $line"
@@ -182,12 +245,16 @@ setup_local_cratesio() {
 
   >/dev/null popd
 
-  export SPUB_REGISTRY=local
   export SPUB_CRATES_API=http://localhost:8888/api/v1
+  export SPUB_REGISTRY=local
   export SPUB_REGISTRY_TOKEN="$token"
+  export CARGO_REGISTRIES_LOCAL_TOKEN="$token"
 }
 
 setup_subpub() {
+  if [ -e "$tmp_cargo_root/bin/subpub" ]; then
+    return
+  fi
   local branch="$1"
   cargo install --quiet \
     --git https://github.com/paritytech/subpub \
@@ -234,11 +301,9 @@ setup_postgres() {
 }
 
 load_workspace_crates() {
-  if [ "${workspace_crates:-}" ]; then
-    return
-  fi
+  local manifest_path="${1:-$root/Cargo.toml}"
   readarray -t workspace_crates < <(
-    cargo tree --quiet --workspace --depth 0 --manifest-path "$root/Cargo.toml" |
+    cargo tree --quiet --workspace --depth 0 --manifest-path "$manifest_path" |
     awk '{ if (length($1) == 0 || substr($1, 1, 1) == "[") { skip } else { print $1 } }' |
     sort |
     uniq
@@ -369,12 +434,10 @@ check_repository() {
     local pr_number="$this_ref"
 
     changed_pr_files=()
-    set +x
     while IFS= read -r diff_line; do
       if ! [[ "$diff_line" =~ ^\+\+\+[[:space:]]+b/(.+)$ ]]; then
         continue
       fi
-      set -x
       local changed_file="${BASH_REMATCH[1]}"
       changed_pr_files+=("$changed_file")
       case "$changed_file" in
@@ -399,7 +462,6 @@ check_repository() {
           esac
         ;;
       esac
-      set +x
     done < <(
       curl -sSLf \
         -H "Accept: application/vnd.github.v3.diff" \
@@ -407,7 +469,6 @@ check_repository() {
         "$gh_api/repos/$repo_owner/$repo/pulls/$pr_number" \
       || die all "Failed to get diff for PR $pr_number"
     )
-    set -x
   else
     load_publishable_workspace_crates
     selected_crates=("${publishable_workspace_crates[@]}")
@@ -447,16 +508,24 @@ setup_repository() {
   git config core.excludesFile "$tmp/.gitignore"
 }
 
+setup_local_cratesio_target() {
+  local cratesio_local_crates="${1:-}"
+
+  apt update -qq
+  setup_postgres
+  # diesel setup should be after setup_progress because it depends on libpq
+  setup_diesel
+  setup_local_cratesio "$cratesio_local_crates"
+}
+
 main() {
-  # Script-specific variables
-  # shellcheck disable=SC2153 # lowercase counterpart
-  local cratesio_target_instance="$CRATESIO_TARGET_INSTANCE"
+  # Script-specific definitions
+  local gh_api="https://api.github.com"
+  local cratesio_api="https://crates.io/api"
+
+  # Script-specific inputs
   # shellcheck disable=SC2153 # lowercase counterpart
   local cratesio_crates_owner="$CRATESIO_CRATES_OWNER"
-  # shellcheck disable=SC2153 # lowercase counterpart
-  local gh_api="$GH_API"
-  # shellcheck disable=SC2153 # lowercase counterpart
-  local cratesio_api="$CRATESIO_API"
   # shellcheck disable=SC2153 # lowercase counterpart
   local repo_owner="$REPO_OWNER"
   # shellcheck disable=SC2153 # lowercase counterpart
@@ -464,12 +533,14 @@ main() {
   local spub_start_from="${SPUB_START_FROM:-}"
   local spub_publish_only="${SPUB_PUBLISH_ONLY:-}"
   local spub_verify_from="${SPUB_VERIFY_FROM:-}"
-  local spub_after_publish_delay="${SPUB_AFTER_PUBLISH_DELAY:-}"
   local spub_exclude="${SPUB_EXCLUDE:-}"
   local spub_branch="${SPUB_BRANCH:-releng}"
   local spub_publish_all="${SPUB_PUBLISH_ALL:-}"
   local github_token="${GITHUB_TOKEN:-}"
   local cratesio_token="${CRATESIO_PUBLISH_TOKEN:-}"
+  local only_check_pipeline="${ONLY_CHECK_PIPELINE:-}"
+  local cratesio_target_instance="${CRATESIO_TARGET_INSTANCE:-}"
+  local spub_stop_at_step="${SPUB_STOP_AT_STEP:-}"
 
   # Variables inherited from GitLab CI
   local this_ref="$CI_COMMIT_REF_NAME"
@@ -487,6 +558,37 @@ main() {
   local is_tag_ref
   if [ "$ci_commit_tag" ]; then
     is_tag_ref=true
+  fi
+
+  if [ "$only_check_pipeline" ]; then
+    # Use git ls-remote to query what's the latest commit for this ref upstream
+    local remote_head_sha_cmd=(
+      git
+      ls-remote
+      "https://github.com/$repo_owner/$repo"
+      "$this_ref"
+    )
+    local remote_head_sha
+    remote_head_sha="$("${remote_head_sha_cmd[@]}")"
+
+    local expected_remote_head_sha="$initial_commit_sha"$'\t'
+    if [ "${is_tag_ref:-}" ]; then
+      expected_remote_head_sha+="refs/tags/$this_ref"
+    else
+      expected_remote_head_sha+="refs/heads/$this_ref"
+    fi
+
+    if [ "$remote_head_sha" != "$expected_remote_head_sha" ]; then
+      die "Unexpected output for command: ${remote_head_sha_cmd[*]}
+
+Expected: $expected_remote_head_sha
+
+Actual: $remote_head_sha
+
+Note: this pipeline should only be run for the latest commit of $this_ref!"
+    fi
+
+    exit 0
   fi
 
   git config --global user.name "CI"
@@ -510,21 +612,59 @@ main() {
 
   local pr_commit_message_start="[CI] adjust workspace versions after publishing"
 
+  local should_setup_local_cargo_config
+  local publish_dependencies_locally
   local check_for_crate_compliance
-  local check_for_latest_commit
   local check_commit_msg
+  local prevent_target_setup
   case "$cratesio_target_instance" in
     local)
       check_for_crate_compliance=true
+
+      case "$spub_stop_at_step" in
+        validation)
+          prevent_target_setup=true
+        ;;
+        "")
+          should_setup_local_cargo_config=true
+        ;;
+        *)
+          die "Invalid \$spub_stop_at_step: $spub_stop_at_step"
+        ;;
+      esac
+
+      case "$repo" in
+        substrate) ;;
+        polkadot)
+          if [ ! "${prevent_target_setup:-}" ]; then
+            publish_dependencies_locally=true
+          fi
+        ;;
+        *)
+          die "Repository is not supported: $repo"
+        ;;
+      esac
     ;;
     default)
       # crate compliance is not checked for this target because we assume it has
       # already been checked previously, when this script ran for local target
+
+      case "$repo" in
+        substrate) ;;
+        polkadot)
+          # TODO: Go further when Polkadot crates can be published
+          log "Publishing to crates.io is temporarily disabled for this repository"
+          exit 0
+        ;;
+        *)
+          die "Target $cratesio_target_instance is disabled for this repository"
+        ;;
+      esac
+
       check_commit_msg=true
-      check_for_latest_commit=true
     ;;
     *)
-      die "Invalid target: $cratesio_target_instance"
+      die "Invalid \$cratesio_target_instance: $cratesio_target_instance"
     ;;
   esac
 
@@ -538,35 +678,6 @@ main() {
     fi
   fi
 
-  if [ "${check_for_latest_commit:-}" ]; then
-    # Use git ls-remote to query what's the latest commit for this ref upstream
-    local remote_head_sha_cmd=(
-      git
-      ls-remote
-      "https://github.com/$repo_owner/$repo"
-      "$this_ref"
-    )
-    local remote_head_sha
-    remote_head_sha="$("${remote_head_sha_cmd[@]}")"
-
-    local expected_remote_head_sha="$initial_commit_sha"$'\t'
-    if [ "$is_tag_ref" ]; then
-      expected_remote_head_sha+="refs/tags/$this_ref"
-    else
-      expected_remote_head_sha+="refs/heads/$this_ref"
-    fi
-
-    if [ "$remote_head_sha" != "$expected_remote_head_sha" ]; then
-      die "Unexpected output for command: ${remote_head_sha_cmd[*]}
-
-Expected: $expected_remote_head_sha
-
-Actual: $remote_head_sha
-
-Note: this script should only be run for the latest commit of $this_ref!"
-    fi
-  fi
-
   check_repository \
     "$cratesio_api" \
     "$cratesio_crates_owner" \
@@ -577,7 +688,7 @@ Note: this script should only be run for the latest commit of $this_ref!"
     "${check_for_crate_compliance:-}" \
     "${is_pr_branch:-}"
 
-  local subpub_args=(publish --root "$PWD")
+  local subpub_args=(publish --root "$root")
 
   local crates_to_publish=()
 
@@ -593,8 +704,9 @@ Note: this script should only be run for the latest commit of $this_ref!"
   done < <(echo "$spub_publish_only")
 
   if [ ${#crates_to_publish[*]} -eq 0 ]; then
-    if [ "$spub_publish_all" ]; then
-      :
+    if [ "$spub_publish_all" ] || [ ! "${is_pr_branch:-}" ]; then
+      load_publishable_workspace_crates
+      crates_to_publish=("${publishable_workspace_crates[@]}")
     elif [ "${changed_pr_files:-}" ]; then
       for file in "${changed_pr_files[@]}"; do
         local current="$file"
@@ -630,6 +742,7 @@ Note: this script should only be run for the latest commit of $this_ref!"
                   unset crate_already_inserted
                 else
                   crates_to_publish+=("$crate")
+                  subpub_args+=(--verify-only "$crate")
                 fi
               ;;
               false) ;;
@@ -642,33 +755,200 @@ Note: this script should only be run for the latest commit of $this_ref!"
           fi
         done
       done
-      if [ ${#crates_to_publish[*]} -gt 0 ]; then
-        for crate in "${crates_to_publish[@]}"; do
-          subpub_args+=(--verify-only "$crate")
-        done
-      else
-        log "No crate changes were detected for this PR"
+    fi
+
+    if [ ${#crates_to_publish[*]} -eq 0 ]; then
+      if [ "${is_pr_branch:-}" ]; then
+        log "No crate changes were detected for this PR, therefore no crates will be published"
         exit
+      else
+        die "No crates to publish"
       fi
-    elif [ "${is_pr_branch:-}" ]; then
-      log "No file changes were detected for this PR"
-      exit
+    fi
+  fi
+
+  if [ "${publish_dependencies_locally:-}" ]; then
+    local substrate_git_url="https://github.com/$repo_owner/substrate"
+    local substrate_git_source_prefix="git+$substrate_git_url"
+    local spub_substrate_publish_args=()
+    local substrate_crates_to_publish=()
+    local substrate_source_to_publish
+
+    local workspace_metadata
+    workspace_metadata="$(cargo metadata --quiet --format-version=1 --all-features)"
+
+    for crate in "${crates_to_publish[@]}"; do
+      case "$repo" in
+        substrate) ;;
+        polkadot)
+          while IFS= read -r line; do
+            if ! [[ "$line" =~ ^([^[:space:]]+)[[:space:]]+([^[:space:]]+) ]]; then
+              die "cargo-metadata line output had unexpected format: $line"
+            fi
+
+            local dep="${BASH_REMATCH[1]}"
+            local source="${BASH_REMATCH[2]}"
+
+            case "$source" in
+              registry+*)
+                # crates.io dependency
+              ;;
+              null)
+                # workspace dependency
+              ;;
+              "$substrate_git_source_prefix?"*)
+                # Substrate git dependency
+
+                local crate_already_inserted
+                for substrate_crate in "${substrate_crates_to_publish[@]}"; do
+                  if [ "$substrate_crate" == "$dep" ]; then
+                    crate_already_inserted=true
+                    break
+                  fi
+                done
+
+                if [ "${crate_already_inserted:-}" ]; then
+                  unset crate_already_inserted
+                else
+                  substrate_crates_to_publish+=("$dep")
+                  spub_substrate_publish_args+=(
+                    --publish-only "$dep"
+                    --crate-debug-description "$dep=This crate was detected as a dependency of Polkadot crate $crate, hence why it's being listed for publishing"
+                  )
+                fi
+              ;;
+              *)
+                die "Unsupported source from metadata for dependency $dep of crate $crate: $source"
+              ;;
+            esac
+          done < <(
+            (
+              echo "$workspace_metadata" | jq --arg crate "$crate" -r '
+                . as $in |
+                paths | select(
+                  (. | length == 2) and # .package, [N]
+                  .[0] == "packages" and
+                  # .source == null for workspace crates
+                  (. as $path | $in | getpath($path + ["source"])==null) and
+                  (. as $path | $in | getpath($path + ["name"])==$crate)
+                ) as $crate_path |
+                $in | getpath($crate_path) |
+                .dependencies[] |
+                select(.kind != "dev") |
+                "\(.name) \(.source)"
+              '
+            ) || die all "Failed to parse cargo metadata for crate $crate"
+          )
+
+          while IFS= read -r line; do
+            if ! [[
+              "$line" =~ ^├──[[:space:]]+([^[:space:]]+)[[:space:]]+[^[:space:]]+[[:space:]]+\(([^\(]+)\)
+            ]]; then
+              continue
+            fi
+
+            local dep="${BASH_REMATCH[1]}"
+            local source="${BASH_REMATCH[2]}"
+
+            case "$source" in
+              "*"|proc-macro)
+                # crates.io dependency or proc-macros
+              ;;
+              "$root"|"$root"/*)
+                # workspace dependency
+              ;;
+              "$substrate_git_url?"*)
+                # Substrate git dependency
+                case "${substrate_source_to_publish:-}" in
+                  "")
+                    substrate_source_to_publish="$source"
+                  ;;
+                  "$source") ;;
+                  *)
+                    local error="Two different Substrate sources are used in the dependencies of $crate:"
+                    error+=$'\n'"$source"
+                    error+=$'\n'"$substrate_source_to_publish"
+                    die "$error"
+                  ;;
+                esac
+              ;;
+              *)
+                die "Unsupported source for dependency $dep of crate $crate: $source"
+              ;;
+            esac
+          done < <(
+            cargo tree \
+              --quiet \
+              -e normal,build \
+              --all-features \
+              -p "$crate" \
+            || die all "Failed to run cargo tree for crate $crate"
+          )
+        ;;
+        *)
+          die "Repository is not supported: $repo"
+        ;;
+      esac
+    done
+
+    if [ "${substrate_source_to_publish:-}" ]; then
+      local substrate_commit
+      if [[ "$substrate_source_to_publish" =~ \#(.*)$ ]]; then
+        substrate_commit="${BASH_REMATCH[1]}"
+      else
+        die "Failed to parse Substrate commit from $substrate_source_to_publish"
+      fi
+
+      >/dev/null pushd "$tmp"
+      curl -sSLf \
+        -o substrate.zip \
+        "$substrate_git_url/archive/$substrate_commit.zip"
+      unzip -qq substrate.zip
+      rm substrate.zip
+      mv substrate-"$substrate_commit"* substrate
+      >/dev/null popd
+
+      >/dev/null pushd "$tmp/substrate"
+      git -c init.defaultBranch=master init -q
+      git add .
+      git commit -qm 'initialize'
+      >/dev/null popd
+
+      load_workspace_crates
+      local root_workspace_crates=("${workspace_crates[@]}")
+      load_workspace_crates "$tmp/substrate/Cargo.toml"
+      setup_local_cratesio_target "${root_workspace_crates[*]} ${workspace_crates[*]}"
+      prevent_target_setup=true
+      workspace_crates=("${root_workspace_crates[@]}")
+      unset root_workspace_crates
+
+      setup_subpub "$spub_branch"
+      setup_local_cargo_config "$initial_commit_sha" on
+      subpub publish \
+        --root "$tmp/substrate" \
+        --verify-none \
+        "${spub_substrate_publish_args[@]}"
+      setup_local_cargo_config "$initial_commit_sha" off
+
+      while IFS= read -r published_crate_name_and_version; do
+        subpub_args+=(
+          --set-dependency-version "$published_crate_name_and_version"
+        )
+      done < "$published_crates_log"
+
+      rm -rf substrate
     fi
   fi
 
   local should_submit_pr use_clean_environment
-
   case "$cratesio_target_instance" in
     local)
       if [ ! "${is_pr_branch:-}" ]; then
         subpub_args+=(--post-check)
       fi
-
-      apt update -qq
-      setup_postgres
-      # diesel setup should be after setup_progress because it depends on libpq
-      setup_diesel
-      setup_local_cratesio
+      if [ ! "${prevent_target_setup:-}" ]; then
+        setup_local_cratesio_target
+      fi
     ;;
     default)
       if [ ! "$github_token" ]; then
@@ -685,13 +965,14 @@ Note: this script should only be run for the latest commit of $this_ref!"
       subpub_args+=(
         --index-url "https://raw.githubusercontent.com/rust-lang/crates.io-index"
         --index-repository "https://github.com/rust-lang/crates.io-index"
+        --after-publish-delay 64
       )
 
       should_submit_pr=true
       use_clean_environment=true
     ;;
     *)
-      die "Invalid target: $cratesio_target_instance"
+      die "Invalid \$cratesio_target_instance: $cratesio_target_instance"
     ;;
   esac
 
@@ -709,10 +990,6 @@ Note: this script should only be run for the latest commit of $this_ref!"
 
   if [ "$spub_verify_from" ]; then
     subpub_args+=(--verify-from "$spub_verify_from")
-  fi
-
-  if [ "$spub_after_publish_delay" ]; then
-    subpub_args+=(--after-publish-delay "$spub_after_publish_delay")
   fi
 
   while IFS= read -r crate; do
@@ -741,9 +1018,12 @@ Note: this script should only be run for the latest commit of $this_ref!"
     mkdir -p "$CARGO_TARGET_DIR"
     export CARGO_HOME="$tmp/cargo"
     mkdir -p "$CARGO_HOME"
+
     subpub_args+=(
       # Clearing $CARGO_HOME is needed to force cargo to redownload the
-      # crates.io index after crates are published.
+      # crates.io index after crates are published. We do this because cargo
+      # doesn't properly update the registry incrementally, so we end up not
+      # finding the crates which were recently published.
       # TODO: doing this introduces a lot of delay since the crates.io index has
       # to be redownloaded after each crate is published. We should find a
       # sensible workaround which isn't about nuking the registry cache.
@@ -751,26 +1031,44 @@ Note: this script should only be run for the latest commit of $this_ref!"
     )
   fi
 
+  if [ "${spub_stop_at_step:-}" ]; then
+    subpub_args+=(--stop-at-step "$spub_stop_at_step")
+  fi
+
+  case "$repo" in
+    substrate) ;;
+    polkadot)
+      subpub_args+=(
+        # it's necessary to clean up the wbuild folder in order to free up disk
+        # space; see https://github.com/paritytech/ci_cd/issues/726
+        --post-publish-cleanup-glob "${CARGO_TARGET_DIR:-$root/target}/**/wbuild"
+      )
+    ;;
+    *)
+      die "Repository is not supported: $repo"
+    ;;
+  esac
+
+  if [ "${should_setup_local_cargo_config:-}" ]; then
+    setup_local_cargo_config "$initial_commit_sha" on
+  fi
+
   local subpub_exit_code=0
   subpub "${subpub_args[@]}" || subpub_exit_code=$?
 
-  local has_diff
-
-  if [ ! "${is_pr_branch:-}" ]; then
-    local diff
-    diff="$(git diff "$initial_commit_sha")"
-
-    if [ "${SPUB_TMP:-}" ]; then
-      mkdir -p "$SPUB_TMP"
-      echo "$diff" > "$SPUB_TMP/after-publish.diff"
-    fi
-
-    if [ ${#diff} -gt 0 ]; then
-      has_diff=true
-    fi
+  if [ "${should_setup_local_cargo_config:-}" ]; then
+    setup_local_cargo_config "$initial_commit_sha" off
   fi
 
-  if [ "${should_submit_pr:-}" ] && [ "${has_diff:-}" ] && [ "$subpub_exit_code" -eq 0 ]; then
+  local diff
+  diff="$(git diff "$initial_commit_sha")"
+
+  if [ "$subpub_exit_code" -ne 0 ] && [ "${SPUB_TMP:-}" ]; then
+    mkdir -p "$SPUB_TMP"
+    echo "$diff" > "$SPUB_TMP/after-publish.diff"
+  fi
+
+  if [ "${should_submit_pr:-}" ] && [ ${#diff} -gt 0 ] && [ "$subpub_exit_code" -eq 0 ]; then
     git reset -q "$initial_commit_sha"
     git add .
     git commit -q -m "$pr_commit_message_start" -m "generated from $ci_job_url"
